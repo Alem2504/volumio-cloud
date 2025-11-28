@@ -1,5 +1,10 @@
 // =========================================
-// CLOUD AUDIO CONTROL SERVER (FINAL VERSION)
+// CLOUD AUDIO CONTROL SERVER (FINAL-CLEAN)
+// Supports:
+// - WebSocket device registration
+// - Persistent device state memory
+// - Command forwarding
+// - /devices, /state, /send
 // =========================================
 
 const express = require("express");
@@ -10,33 +15,37 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// WebSocket connections: deviceId → ws
-let devices = {};
+// Active device websocket connections
+let devices = {}; // deviceId → ws
 
-// Last known state per device: deviceId → {}
-let deviceState = {};
+// Device state memory (survives reconnect)
+let deviceState = {}; // deviceId → { status, stream, volume, lastSeen, online }
 
 
 // =========================================
 // BASIC ROUTES
 // =========================================
 
+// Test route
 app.get("/", (req, res) => {
-    res.json({ ok: true, message: "Cloud server online." });
+    res.json({ ok: true, message: "Cloud audio server running." });
 });
 
+// Return list of devices
 app.get("/devices", (req, res) => {
     res.json({
-        online: Object.keys(devices),
-        knownDevices: Object.keys(deviceState)
+        ok: true,
+        online: Object.keys(devices),         // devices currently connected
+        knownDevices: Object.keys(deviceState) // devices that ever sent state
     });
 });
 
+// Full state for dashboard
 app.get("/state", (req, res) => {
     res.json(deviceState);
 });
 
-// SEND COMMAND TO DEVICE
+// Send command to a device
 app.post("/send/:id", (req, res) => {
     const id = req.params.id;
 
@@ -46,49 +55,52 @@ app.post("/send/:id", (req, res) => {
 
     try {
         devices[id].send(JSON.stringify(req.body));
-        return res.json({ ok: true, sent: req.body });
+        res.json({ ok: true, sent: req.body });
     } catch (err) {
-        return res.json({ ok: false, error: err.message });
+        res.json({ ok: false, error: err.message });
     }
 });
 
 
 // =========================================
-// SERVER + WEBSOCKETS
+// START SERVER (HTTP + WS on same port)
 // =========================================
 
 const PORT = process.env.PORT || 3001;
+
 const server = app.listen(PORT, () => {
-    console.log("Cloud server running on port", PORT);
+    console.log(`Cloud server running on port ${PORT}`);
 });
 
+// Create WebSocket server
 const wss = new WebSocketServer({ server });
 
 
 // =========================================
-// WEBSOCKET HANDLER
+// WEBSOCKET DEVICE HANDLING
 // =========================================
 
 wss.on("connection", ws => {
-    let boundId = null; // Assigned AFTER agent sends its ID
+    let boundId = null;
 
-    console.log("Client connected (waiting for deviceId)...");
+    console.log("New WS connection — waiting for deviceId...");
 
     ws.on("message", raw => {
-        let data = {};
-
+        let data;
         try {
             data = JSON.parse(raw);
         } catch {
-            console.log("Invalid message:", raw.toString());
+            console.log("Invalid WS message:", raw.toString());
             return;
         }
 
-        // Agent handshake (deviceId)
+        // =====================================================
+        // 1. DEVICE HANDSHAKE — first message MUST send deviceId
+        // =====================================================
         if (data.deviceId) {
             boundId = data.deviceId;
 
-            devices[boundId] = ws;
+            devices[boundId] = ws; // map deviceId → ws
 
             if (!deviceState[boundId]) {
                 deviceState[boundId] = {};
@@ -97,7 +109,7 @@ wss.on("connection", ws => {
             deviceState[boundId].online = true;
             deviceState[boundId].lastSeen = Date.now();
 
-            // Store status fields if present
+            // Write optional fields
             if (data.status !== undefined) deviceState[boundId].status = data.status;
             if (data.stream !== undefined) deviceState[boundId].stream = data.stream;
             if (data.volume !== undefined) deviceState[boundId].volume = data.volume;
@@ -106,12 +118,15 @@ wss.on("connection", ws => {
             return;
         }
 
+        // If still no deviceId — ignore everything
         if (!boundId) {
-            console.log("Ignoring message (no deviceId yet)");
+            console.log("Ignoring message until deviceId is provided.");
             return;
         }
 
-        // Update status
+        // =====================================================
+        // 2. DEVICE UPDATES (heartbeat, status, stream, volume)
+        // =====================================================
         deviceState[boundId] = {
             ...deviceState[boundId],
             ...data,
