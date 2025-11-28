@@ -1,45 +1,42 @@
 // =========================================
-// CLOUD AUDIO CONTROL SERVER (Render-ready)
+// CLOUD AUDIO CONTROL SERVER (FINAL VERSION)
 // =========================================
 
 const express = require("express");
 const cors = require("cors");
-const { v4: uuidv4 } = require("uuid");
 const { WebSocketServer } = require("ws");
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Device connections: deviceId → ws
+// WebSocket connections: deviceId → ws
 let devices = {};
 
-// Device states: deviceId → { status, stream, volume, lastSeen }
+// Last known state per device: deviceId → {}
 let deviceState = {};
 
 
 // =========================================
-// 1. BASIC ENDPOINT
+// BASIC ROUTES
 // =========================================
+
 app.get("/", (req, res) => {
-    res.json({ ok: true, message: "Cloud audio server running." });
+    res.json({ ok: true, message: "Cloud server online." });
 });
 
-
-// =========================================
-// 2. RETURN CONNECTED DEVICES
-// =========================================
 app.get("/devices", (req, res) => {
     res.json({
-        count: Object.keys(devices).length,
-        devices: Object.keys(devices)
+        online: Object.keys(devices),
+        knownDevices: Object.keys(deviceState)
     });
 });
 
+app.get("/state", (req, res) => {
+    res.json(deviceState);
+});
 
-// =========================================
-// 3. SEND COMMAND TO A DEVICE
-// =========================================
+// SEND COMMAND TO DEVICE
 app.post("/send/:id", (req, res) => {
     const id = req.params.id;
 
@@ -49,91 +46,85 @@ app.post("/send/:id", (req, res) => {
 
     try {
         devices[id].send(JSON.stringify(req.body));
+        return res.json({ ok: true, sent: req.body });
     } catch (err) {
-        return res.json({ ok: false, error: "Send failed" });
+        return res.json({ ok: false, error: err.message });
     }
-
-    res.json({ ok: true, sent: req.body });
 });
 
 
 // =========================================
-// 4. GET DEVICE STATUS
-// =========================================
-app.get("/device/:id/status", (req, res) => {
-    const id = req.params.id;
-
-    if (!deviceState[id]) {
-        return res.json({ ok: false, error: "Device not found" });
-    }
-
-    res.json({
-        id,
-        online: Date.now() - deviceState[id].lastSeen < 10000,
-        ...deviceState[id]
-    });
-});
-
-
-// =========================================
-// 5. START SERVER (Express + WS on same port)
+// SERVER + WEBSOCKETS
 // =========================================
 
 const PORT = process.env.PORT || 3001;
-
 const server = app.listen(PORT, () => {
-    console.log("HTTP + WebSocket server running on port", PORT);
+    console.log("Cloud server running on port", PORT);
 });
-
-
-// =========================================
-// 6. WEBSOCKET SERVER (DEVICE CONNECTIONS)
-// =========================================
 
 const wss = new WebSocketServer({ server });
 
+
+// =========================================
+// WEBSOCKET HANDLER
+// =========================================
+
 wss.on("connection", ws => {
-    const deviceId = uuidv4();
-    devices[deviceId] = ws;
+    let boundId = null; // Assigned AFTER agent sends its ID
 
-    // Initialize state
-    deviceState[deviceId] = {
-        status: "unknown",
-        stream: null,
-        volume: null,
-        lastSeen: Date.now()
-    };
+    console.log("Client connected (waiting for deviceId)...");
 
-    console.log("Device connected:", deviceId);
-
-    // When device sends message to cloud
     ws.on("message", raw => {
-        try {
-            const data = JSON.parse(raw);
+        let data = {};
 
-            // Device heartbeats
-            if (data.deviceId) {
-                deviceState[data.deviceId] = {
-                    status: data.status || "unknown",
-                    stream: data.stream || null,
-                    volume: data.volume ?? null,
-                    lastSeen: Date.now()
-                };
-                return;
+        try {
+            data = JSON.parse(raw);
+        } catch {
+            console.log("Invalid message:", raw.toString());
+            return;
+        }
+
+        // Agent handshake (deviceId)
+        if (data.deviceId) {
+            boundId = data.deviceId;
+
+            devices[boundId] = ws;
+
+            if (!deviceState[boundId]) {
+                deviceState[boundId] = {};
             }
 
-            // For debugging raw messages
-            console.log(`[${deviceId}]`, data);
+            deviceState[boundId].online = true;
+            deviceState[boundId].lastSeen = Date.now();
 
-        } catch (err) {
-            console.log("Invalid WS message:", raw.toString());
+            // Store status fields if present
+            if (data.status !== undefined) deviceState[boundId].status = data.status;
+            if (data.stream !== undefined) deviceState[boundId].stream = data.stream;
+            if (data.volume !== undefined) deviceState[boundId].volume = data.volume;
+
+            console.log("Device registered:", boundId);
+            return;
         }
+
+        if (!boundId) {
+            console.log("Ignoring message (no deviceId yet)");
+            return;
+        }
+
+        // Update status
+        deviceState[boundId] = {
+            ...deviceState[boundId],
+            ...data,
+            lastSeen: Date.now(),
+            online: true
+        };
     });
 
-    // When device disconnects
     ws.on("close", () => {
-        delete devices[deviceId];
-        delete deviceState[deviceId];
-        console.log("Device disconnected:", deviceId);
+        if (boundId) {
+            console.log("Device disconnected:", boundId);
+            deviceState[boundId].online = false;
+            delete devices[boundId];
+        }
     });
 });
