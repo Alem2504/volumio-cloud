@@ -1,62 +1,91 @@
+// =====================
+// CLOUD AUDIO CONTROL SERVER (Render-ready)
+// =====================
+
 const express = require("express");
 const cors = require("cors");
-const http = require("http");
-const { Server } = require("socket.io");
+const { v4: uuidv4 } = require("uuid");
+const { WebSocketServer } = require("ws");
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors());
 
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*" }
+// Devices registry: deviceId → ws
+let devices = {};
+
+
+// =====================
+// 1. EXPRESS SERVER (HTTP API)
+// =====================
+
+app.get("/", (req, res) => {
+    res.json({ ok: true, message: "Cloud audio server running." });
 });
 
-// Global status od Volumio uređaja
-let volumioStatus = {
-    online: false,
-    volume: 0,
-    status: "stop",
-    uri: "",
-    track: "",
-    artist: "",
-    lastUpdate: null
-};
-
-// Kada se Volumio Agent spoji
-io.on("connection", (socket) => {
-    console.log("Connected:", socket.id);
-
-    // Klijent kaže da je on PI AGENT
-    socket.on("identify_pi", () => {
-        volumioStatus.online = true;
-        volumioStatus.lastUpdate = new Date();
-        socket.join("pi");
-        console.log("Volumio AGENT ONLINE");
-    });
-
-    // Primamo status od Volumio Agenta
-    socket.on("pi_status", (data) => {
-        volumioStatus = { ...volumioStatus, ...data, online: true, lastUpdate: new Date() };
-        io.emit("dashboard_status", volumioStatus);
-    });
-
-    // Dashboard šalje komande → prosljeđujemo tylko Volumio Agentu
-    socket.on("dashboard_command", (cmd) => {
-        io.to("pi").emit("pi_command", cmd);
-    });
-
-    socket.on("disconnect", () => {
-        console.log("Client disconnected:", socket.id);
+// List all connected devices
+app.get("/devices", (req, res) => {
+    res.json({
+        count: Object.keys(devices).length,
+        devices: Object.keys(devices)
     });
 });
 
-// fallback REST endpoint
-app.get("/status", (req, res) => {
-    res.json(volumioStatus);
+// Send command to device
+app.post("/send/:id", (req, res) => {
+    const id = req.params.id;
+
+    if (!devices[id]) {
+        return res.json({ ok: false, error: "Device not connected" });
+    }
+
+    try {
+        devices[id].send(JSON.stringify(req.body));
+    } catch (err) {
+        return res.json({ ok: false, error: "Send failed" });
+    }
+
+    res.json({ ok: true, sent: req.body });
 });
+
+
+// =====================
+// 2. COMBINED SERVER (Express + WebSocket)
+//    Render requires ONE PORT ONLY
+// =====================
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-    console.log("Cloud server running on port", PORT);
+
+const server = app.listen(PORT, () => {
+    console.log("HTTP + WebSocket server running on port", PORT);
+});
+
+
+// =====================
+// 3. WEBSOCKET SERVER
+// =====================
+
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", ws => {
+    const deviceId = uuidv4();
+    devices[deviceId] = ws;
+
+    console.log("Device connected:", deviceId);
+
+    // When device sends something to cloud
+    ws.on("message", msg => {
+        try {
+            const data = JSON.parse(msg);
+            console.log(`[${deviceId}]`, data);
+        } catch (e) {
+            console.log("Invalid message:", msg.toString());
+        }
+    });
+
+    // If device disconnects
+    ws.on("close", () => {
+        delete devices[deviceId];
+        console.log("Device disconnected:", deviceId);
+    });
 });
