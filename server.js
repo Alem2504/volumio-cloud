@@ -7,11 +7,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// DEVICE STORAGE
+// --------------------------------
+// DEVICE & DASHBOARD STORAGE
+// --------------------------------
 let devices = {};
 let dashboards = [];
 
-// HEALTH ENDPOINT (Render requires this!)
+// --------------------------------
+// HEALTH CHECK FOR RENDER
+// --------------------------------
 app.get("/health", (req, res) => res.send("ok"));
 
 // Create HTTP server
@@ -21,9 +25,9 @@ const server = http.createServer(app);
 const deviceWSS = new WebSocketServer({ noServer: true });
 const dashboardWSS = new WebSocketServer({ noServer: true });
 
-// ----------------------------
-// 🔥 UPGRADE HANDLER (Render-friendly)
-// ----------------------------
+// --------------------------------
+// WEBSOCKET UPGRADE HANDLER
+// --------------------------------
 server.on("upgrade", (req, socket, head) => {
     const pathname = req.url.split("?")[0];
 
@@ -42,9 +46,9 @@ server.on("upgrade", (req, socket, head) => {
     }
 });
 
-// ----------------------------
-// 📡 DEVICE CONNECTION
-// ----------------------------
+// --------------------------------
+// DEVICE CONNECTION
+// --------------------------------
 deviceWSS.on("connection", (ws, req) => {
     const query = new URLSearchParams(req.url.split("?")[1]);
     const id = query.get("id");
@@ -56,37 +60,55 @@ deviceWSS.on("connection", (ws, req) => {
 
     devices[id] = {
         socket: ws,
-        state: { online: true, lastUpdate: Date.now() }
+        state: {
+            online: true,
+            lastUpdate: Date.now()
+        }
     };
 
-    console.log("Device connected:", id);
+    console.log("🔌 Device connected:", id);
     broadcastDashboard();
 
     ws.on("message", (msg) => {
-        const data = JSON.parse(msg);
+        let data;
+        try {
+            data = JSON.parse(msg);
+        } catch (e) {
+            console.log("Invalid JSON from device", id);
+            return;
+        }
+
         devices[id].state = {
             ...devices[id].state,
             ...data,
             online: true,
             lastUpdate: Date.now()
         };
+
         broadcastDashboard();
     });
 
     ws.on("close", () => {
-        console.log("Device disconnected:", id);
-        if (devices[id]) devices[id].state.online = false;
+        console.log("❌ Device disconnected:", id);
+        if (devices[id]) {
+            devices[id].state.online = false;
+        }
         broadcastDashboard();
+    });
+
+    ws.on("error", (err) => {
+        console.log("WS error on device", id, err);
     });
 });
 
-// ----------------------------
-// 🖥 DASHBOARD CONNECTION
-// ----------------------------
+// --------------------------------
+// DASHBOARD CONNECTION
+// --------------------------------
 dashboardWSS.on("connection", (ws) => {
-    console.log("Dashboard connected");
+    console.log("🖥 Dashboard connected");
     dashboards.push(ws);
 
+    // Send initial snapshot
     ws.send(JSON.stringify({ type: "devices", devices }));
 
     ws.on("close", () => {
@@ -94,16 +116,22 @@ dashboardWSS.on("connection", (ws) => {
     });
 });
 
+// --------------------------------
+// BROADCAST TO DASHBOARDS
+// --------------------------------
 function broadcastDashboard() {
     const payload = JSON.stringify({ type: "devices", devices });
+
     dashboards.forEach(ws => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(payload);
+        }
     });
 }
 
-// ----------------------------
-// 📮 API COMMANDS
-// ----------------------------
+// --------------------------------
+// API COMMAND → SEND TO DEVICE
+// --------------------------------
 app.post("/device/:id/cmd", (req, res) => {
     const id = req.params.id;
 
@@ -111,24 +139,18 @@ app.post("/device/:id/cmd", (req, res) => {
         return res.json({ ok: false, error: "device offline" });
     }
 
-    devices[id].socket.send(JSON.stringify({ type: "cmd", cmd: req.body }));
+    devices[id].socket.send(JSON.stringify({
+        type: "cmd",
+        cmd: req.body
+    }));
+
     return res.json({ ok: true });
 });
 
-// ----------------------------
-// 🚀 START SERVER
-// ----------------------------
+// --------------------------------
+// START SERVER
+// --------------------------------
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () =>
-    console.log(`Cloud server running on port ${PORT}`)
+    console.log(`🚀 MotoMatic Cloud running at port ${PORT}`)
 );
-
-// ----------------------------
-// ❤️ HEARTBEAT (Render requirement)
-// ----------------------------
-setInterval(() => {
-    for (const id in devices) {
-        const ws = devices[id].socket;
-        if (ws && ws.readyState === WebSocket.OPEN) ws.ping();
-    }
-}, 10000);
