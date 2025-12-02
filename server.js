@@ -2,60 +2,62 @@ import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import cors from "cors";
-import bodyParser from "body-parser";
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// memory state
+// DEVICE STORAGE
 let devices = {};
+let dashboards = [];
 
-// HTTP server
+// HEALTH ENDPOINT (Render requires this!)
+app.get("/health", (req, res) => res.send("ok"));
+
+// Create HTTP server
 const server = http.createServer(app);
 
-// MAIN WS SERVER (for devices)
+// WebSocket servers
 const deviceWSS = new WebSocketServer({ noServer: true });
-
-// DASHBOARD WS SERVER
 const dashboardWSS = new WebSocketServer({ noServer: true });
 
-// Upgrade handler
+// ----------------------------
+// 🔥 UPGRADE HANDLER (Render-friendly)
+// ----------------------------
 server.on("upgrade", (req, socket, head) => {
-    // BLOCK Render health checks (they break WS)
-    if (req.headers["user-agent"]?.includes("Render")) {
-        socket.destroy();
-        return;
-    }
-
     const pathname = req.url.split("?")[0];
 
     if (pathname === "/devices") {
         deviceWSS.handleUpgrade(req, socket, head, (ws) => {
             deviceWSS.emit("connection", ws, req);
         });
+
     } else if (pathname === "/dashboard") {
         dashboardWSS.handleUpgrade(req, socket, head, (ws) => {
-            dashboardWSS.emit("connection", ws, req);
+            dashboardWSS.emit("connection", ws);
         });
+
     } else {
-        socket.destroy(); // reject unknown WS
+        socket.destroy();
     }
 });
 
-// DEVICE WS HANDLING
+// ----------------------------
+// 📡 DEVICE CONNECTION
+// ----------------------------
 deviceWSS.on("connection", (ws, req) => {
-    const params = new URLSearchParams(req.url.split("?")[1]);
-    const id = params.get("id");
+    const query = new URLSearchParams(req.url.split("?")[1]);
+    const id = query.get("id");
 
     if (!id) {
         ws.close();
         return;
     }
 
-    if (!devices[id]) devices[id] = {};
-    devices[id].socket = ws;
-    devices[id].state = { online: true, lastUpdate: Date.now() };
+    devices[id] = {
+        socket: ws,
+        state: { online: true, lastUpdate: Date.now() }
+    };
 
     console.log("Device connected:", id);
     broadcastDashboard();
@@ -73,17 +75,17 @@ deviceWSS.on("connection", (ws, req) => {
 
     ws.on("close", () => {
         console.log("Device disconnected:", id);
-        devices[id].state.online = false;
+        if (devices[id]) devices[id].state.online = false;
         broadcastDashboard();
     });
 });
 
-// DASHBOARD WS HANDLING
-let dashboards = [];
-
+// ----------------------------
+// 🖥 DASHBOARD CONNECTION
+// ----------------------------
 dashboardWSS.on("connection", (ws) => {
-    dashboards.push(ws);
     console.log("Dashboard connected");
+    dashboards.push(ws);
 
     ws.send(JSON.stringify({ type: "devices", devices }));
 
@@ -99,29 +101,34 @@ function broadcastDashboard() {
     });
 }
 
-// API COMMAND ROUTE
+// ----------------------------
+// 📮 API COMMANDS
+// ----------------------------
 app.post("/device/:id/cmd", (req, res) => {
     const id = req.params.id;
-    const cmd = req.body;
 
-    if (!devices[id] || !devices[id].socket || devices[id].socket.readyState !== WebSocket.OPEN) {
+    if (!devices[id] || devices[id].socket.readyState !== WebSocket.OPEN) {
         return res.json({ ok: false, error: "device offline" });
     }
 
-    devices[id].socket.send(JSON.stringify({ type: "cmd", cmd }));
+    devices[id].socket.send(JSON.stringify({ type: "cmd", cmd: req.body }));
     return res.json({ ok: true });
 });
 
-// START SERVER
-server.listen(process.env.PORT || 8080, () => {
-    console.log("Cloud server running on port 8080");
-});
+// ----------------------------
+// 🚀 START SERVER
+// ----------------------------
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () =>
+    console.log(`Cloud server running on port ${PORT}`)
+);
 
-// 🩸 Heartbeat – REQUIRED on Render
+// ----------------------------
+// ❤️ HEARTBEAT (Render requirement)
+// ----------------------------
 setInterval(() => {
     for (const id in devices) {
         const ws = devices[id].socket;
-        if (!ws || ws.readyState !== WebSocket.OPEN) continue;
-        ws.ping();
+        if (ws && ws.readyState === WebSocket.OPEN) ws.ping();
     }
 }, 10000);
