@@ -1,4 +1,5 @@
 import express from "express";
+import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -7,83 +8,120 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Svi uređaji i njihovo stanje
-let devices = {};  // deviceId -> { socket, state }
+// memory state
+let devices = {};
 
-// WebSocket server
-const wss = new WebSocketServer({ noServer: true });
+// HTTP server
+const server = http.createServer(app);
 
-// Kad se RPi poveže
-wss.on("connection", (ws, req) => {
-    const deviceId = new URL(req.url, "http://localhost").searchParams.get("id");
-    console.log("Device connected:", deviceId);
+// MAIN WS SERVER (for devices)
+const deviceWSS = new WebSocketServer({ noServer: true });
 
-    devices[deviceId] = {
-        socket: ws,
-        state: { online: true, lastUpdate: Date.now() }
-    };
+// DASHBOARD WS SERVER
+const dashboardWSS = new WebSocketServer({ noServer: true });
 
-    ws.on("message", msg => {
+// Upgrade handler
+server.on("upgrade", (req, socket, head) => {
+    // BLOCK Render health checks (they break WS)
+    if (req.headers["user-agent"]?.includes("Render")) {
+        socket.destroy();
+        return;
+    }
+
+    const pathname = req.url.split("?")[0];
+
+    if (pathname === "/devices") {
+        deviceWSS.handleUpgrade(req, socket, head, (ws) => {
+            deviceWSS.emit("connection", ws, req);
+        });
+    } else if (pathname === "/dashboard") {
+        dashboardWSS.handleUpgrade(req, socket, head, (ws) => {
+            dashboardWSS.emit("connection", ws, req);
+        });
+    } else {
+        socket.destroy(); // reject unknown WS
+    }
+});
+
+// DEVICE WS HANDLING
+deviceWSS.on("connection", (ws, req) => {
+    const params = new URLSearchParams(req.url.split("?")[1]);
+    const id = params.get("id");
+
+    if (!id) {
+        ws.close();
+        return;
+    }
+
+    if (!devices[id]) devices[id] = {};
+    devices[id].socket = ws;
+    devices[id].state = { online: true, lastUpdate: Date.now() };
+
+    console.log("Device connected:", id);
+    broadcastDashboard();
+
+    ws.on("message", (msg) => {
         const data = JSON.parse(msg);
-        devices[deviceId].state = {
-            ...devices[deviceId].state,
+        devices[id].state = {
+            ...devices[id].state,
             ...data,
             online: true,
             lastUpdate: Date.now()
         };
-
-        // Broadcast dashboard update
         broadcastDashboard();
     });
 
     ws.on("close", () => {
-        console.log("Device disconnected:", deviceId);
-        devices[deviceId].state.online = false;
+        console.log("Device disconnected:", id);
+        devices[id].state.online = false;
         broadcastDashboard();
     });
 });
 
-// HTTP → WebSocket upgrade
-const server = app.listen(8080, () => console.log("Cloud server running on port 8080"));
-server.on("upgrade", (req, socket, head) => {
-    wss.handleUpgrade(req, socket, head, ws => {
-        wss.emit("connection", ws, req);
-    });
-});
-
-// Dashboard WebSocket
-let dashboardClients = [];
-
-const dashboardWSS = new WebSocketServer({ server, path: "/dashboard" });
+// DASHBOARD WS HANDLING
+let dashboards = [];
 
 dashboardWSS.on("connection", (ws) => {
+    dashboards.push(ws);
     console.log("Dashboard connected");
-    dashboardClients.push(ws);
 
     ws.send(JSON.stringify({ type: "devices", devices }));
 
     ws.on("close", () => {
-        dashboardClients = dashboardClients.filter(c => c !== ws);
+        dashboards = dashboards.filter(c => c !== ws);
     });
 });
 
 function broadcastDashboard() {
     const payload = JSON.stringify({ type: "devices", devices });
-
-    dashboardClients.forEach(ws => {
+    dashboards.forEach(ws => {
         if (ws.readyState === WebSocket.OPEN) ws.send(payload);
     });
 }
 
-// API za slanje komandi uređaju
+// API COMMAND ROUTE
 app.post("/device/:id/cmd", (req, res) => {
     const id = req.params.id;
     const cmd = req.body;
 
-    if (!devices[id] || devices[id].socket.readyState !== WebSocket.OPEN) {
+    if (!devices[id] || !devices[id].socket || devices[id].socket.readyState !== WebSocket.OPEN) {
         return res.json({ ok: false, error: "device offline" });
     }
 
     devices[id].socket.send(JSON.stringify({ type: "cmd", cmd }));
     return res.json({ ok: true });
 });
+
+// START SERVER
+server.listen(process.env.PORT || 8080, () => {
+    console.log("Cloud server running on port 8080");
+});
+
+// 🩸 Heartbeat – REQUIRED on Render
+setInterval(() => {
+    for (const id in devices) {
+        const ws = devices[id].socket;
+        if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+        ws.ping();
+    }
+}, 10000);
