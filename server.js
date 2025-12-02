@@ -78,6 +78,8 @@ deviceWSS.on("connection", (ws, req) => {
             return;
         }
 
+        console.log("📥 MSG FROM DEVICE:", data);
+
         devices[id].state = {
             ...devices[id].state,
             ...data,
@@ -152,5 +154,5 @@ app.post("/device/:id/cmd", (req, res) => {
 // --------------------------------
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () =>
-    console.log(`🚀 MotoMatic Cloud running at port ${PORT}`)
+    console.log(`🚀 CraftStudio Cloud running on port ${PORT}`)
 );
